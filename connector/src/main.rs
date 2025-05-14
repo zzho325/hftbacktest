@@ -26,6 +26,7 @@ use tracing::error;
 use crate::{
     binancefutures::BinanceFutures,
     bybit::Bybit,
+    coinbase::Coinbase,
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
     fuse::FusedHashMapMarketDepth,
 };
@@ -34,6 +35,8 @@ use crate::{
 pub mod binancefutures;
 #[cfg(feature = "bybit")]
 pub mod bybit;
+#[cfg(feature = "coinbase")]
+pub mod coinbase;
 
 mod connector;
 mod fuse;
@@ -326,6 +329,15 @@ async fn main() {
             connector.run(pub_tx.clone());
             Box::new(connector)
         }
+        "coinbase" => {
+            let mut connector = Coinbase::build_from(&config)
+                .map_err(|error| {
+                    error!(?error, "Couldn't build the Coinbase connector.");
+                })
+                .unwrap();
+            connector.run(pub_tx.clone());
+            Box::new(connector)
+        }
         connector => {
             error!(%connector, "This connector doesn't exist.");
             exit(1);
@@ -361,3 +373,22 @@ async fn main() {
         .unwrap();
     let _ = handle.join();
 }
+
+// #[tokio::main]
+// async fn main() {
+//     use crate::coinbase::{Coinbase, Config};
+
+//     let mut coinbase = Coinbase {
+//         config: Config {
+//             stream_url: "wss://ws-feed-public.sandbox.exchange.coinbase.com".to_string(),
+//         },
+//     };
+
+//     // Start the stream in the background
+//     coinbase.connect_market_data_stream();
+
+//     // Let the background task run long enough to see output
+//     tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+
+//     println!("Done waiting for stream output.");
+// }
