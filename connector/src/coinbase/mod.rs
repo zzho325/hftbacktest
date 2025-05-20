@@ -1,4 +1,5 @@
 mod market_data_stream;
+mod msg;
 mod ordermanager;
 
 use std::{
@@ -59,7 +60,7 @@ impl ConnectorBuilder for Coinbase {
 }
 
 impl Coinbase {
-    pub fn connect_market_data_stream(&mut self) {
+    pub fn connect_market_data_stream(&mut self, ev_tx: UnboundedSender<PublishEvent>) {
         let public_url = self.config.public_url.clone();
         let key_name = self.config.key_name.clone();
         let key_secret = self.config.key_secret.clone();
@@ -78,7 +79,7 @@ impl Coinbase {
                 .retry(|| async {
                     let mut stream = market_data_stream::MarketDataStream::new(
                         // client.clone(),
-                        // ev_tx.clone(),
+                        ev_tx.clone(),
                         symbol_tx.subscribe(),
                     );
                     stream.connect(&key_name, &key_secret, &public_url).await?;
@@ -102,8 +103,8 @@ impl Connector for Coinbase {
         self.order_manager.clone()
     }
 
-    fn run(&mut self, tx: UnboundedSender<PublishEvent>) {
-        self.connect_market_data_stream();
+    fn run(&mut self, ev_tx: UnboundedSender<PublishEvent>) {
+        self.connect_market_data_stream(ev_tx.clone());
     }
 
     fn submit(&self, symbol: String, order: Order, tx: UnboundedSender<PublishEvent>) {}
