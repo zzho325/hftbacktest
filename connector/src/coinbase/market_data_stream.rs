@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 use anyhow::Error;
 use chrono::Utc;
@@ -32,15 +32,16 @@ use crate::{
 pub struct MarketDataStream {
     ev_tx: UnboundedSender<PublishEvent>,
     symbol_rx: Receiver<String>,
+    level2_channel_tracker: ChannelTracker,
 }
 
 impl MarketDataStream {
-    pub fn new(
-        ev_tx: UnboundedSender<PublishEvent>,
-        symbol_rx: Receiver<String>,
-        // client: CoinbaseClient,
-    ) -> Self {
-        Self { ev_tx, symbol_rx }
+    pub fn new(ev_tx: UnboundedSender<PublishEvent>, symbol_rx: Receiver<String>) -> Self {
+        Self {
+            ev_tx,
+            symbol_rx,
+            level2_channel_tracker: ChannelTracker::new("level2"),
+        }
     }
 
     // TODO: decorate Error.
@@ -122,10 +123,26 @@ impl MarketDataStream {
     }
 
     fn process_level2_channel(&mut self, data: Level2) {
-        // TODO: track sequence number
+        self.level2_channel_tracker.track(data.sequence_num);
+
         for event in data.events {
+            let symbol = &event.product_id;
+            let snapshots = &mut self.level2_channel_tracker.snapshots;
+            if snapshots.get(symbol).copied().unwrap_or(false) {
+                if event.type_ == "snapshot" {
+                    // TODO: a second snapshot should clean depth
+                    error!(channel = "level2", "second snapshot received");
+                }
+            } else {
+                if event.type_ == "snapshot" {
+                    snapshots.insert(symbol.clone(), true);
+                } else {
+                    debug!(channel = "level2", "snapshot not received, ignore update",);
+                    continue;
+                }
+            }
+
             self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
-            // TODO: handle snapshot and updates differently
             for update in event.updates {
                 let depth_ev = match update.side {
                     Side::Bid => LOCAL_BID_DEPTH_EVENT,
@@ -149,6 +166,56 @@ impl MarketDataStream {
                     .unwrap();
             }
             self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
+        }
+    }
+}
+
+struct ChannelTracker {
+    name: &'static str,
+    prev_seq: Option<u64>,
+    snapshots: HashMap<String, bool>,
+}
+
+impl ChannelTracker {
+    fn new(name: &'static str) -> Self {
+        ChannelTracker {
+            name,
+            prev_seq: None,
+            snapshots: Default::default(),
+        }
+    }
+
+    /// Feed in the next sequence number. Logs out-of-order events or dropped messages.
+    fn track(&mut self, seq: u64) {
+        match self.prev_seq {
+            None => {
+                // first message for channel
+                self.prev_seq = Some(seq);
+            }
+            Some(prev) if seq == prev + 1 => {
+                // sequence in order
+                self.prev_seq = Some(seq);
+            }
+            Some(prev) if seq <= prev => {
+                // message out of order
+                debug!(
+                    channel = %self.name,
+                    expected = prev + 1,
+                    actual   = seq,
+                    "out-of-order sequence"
+                );
+            }
+            Some(prev) => {
+                // gap detected
+                error!(
+                    channel  = %self.name,
+                    expected = prev + 1,
+                    actual   = seq,
+                    "sequence gap detected, there is dropped message",
+                );
+                // TODO: dropped message should trigger re-subscription
+                self.prev_seq = Some(seq);
+            }
         }
     }
 }
