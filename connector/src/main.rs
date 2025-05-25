@@ -34,6 +34,7 @@ use tracing::error;
 use crate::{
     binancefutures::BinanceFutures,
     bybit::Bybit,
+    coinbase::Coinbase,
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
     fuse::FusedHashMapMarketDepth,
 };
@@ -42,6 +43,8 @@ use crate::{
 pub mod binancefutures;
 #[cfg(feature = "bybit")]
 pub mod bybit;
+#[cfg(feature = "coinbase")]
+pub mod coinbase;
 
 mod connector;
 mod fuse;
@@ -362,6 +365,15 @@ async fn main() {
             let mut connector = Bybit::build_from(&config)
                 .map_err(|error| {
                     error!(?error, "Couldn't build the Bybit connector.");
+                })
+                .unwrap();
+            connector.run(pub_tx.clone());
+            Box::new(connector)
+        }
+        "coinbase" => {
+            let mut connector = Coinbase::build_from(&config)
+                .map_err(|error| {
+                    error!(?error, "Couldn't build the Coinbase connector.");
                 })
                 .unwrap();
             connector.run(pub_tx.clone());
