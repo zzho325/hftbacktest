@@ -7,6 +7,7 @@ use hftbacktest::types::{LiveEvent, Order};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// A message will be received by the publisher thread and then published to the bots.
+#[derive(Debug)]
 pub enum PublishEvent {
     BatchStart(u64),
     BatchEnd(u64),
