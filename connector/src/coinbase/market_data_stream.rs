@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::Error;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use hftbacktest::{
     live::ipc::TO_ALL,
@@ -23,15 +22,17 @@ use tokio_tungstenite::{
 use tracing::{debug, error};
 
 use crate::{
-    coinbase::msg::stream::{ChannelMessage, Level2, Side, Stream},
+    coinbase::{
+        CoinbaseError,
+        msg::stream::{ChannelMessage, Level2, Side, Stream},
+    },
     connector::PublishEvent,
 };
 
 pub struct MarketDataStream {
     ev_tx: UnboundedSender<PublishEvent>,
     symbol_rx: Receiver<String>,
-    heartbeat_channel_tracker: ChannelSeqTracker,
-    level2_channel_tracker: ChannelSeqTracker,
+    subscription_tracker: SubscriptionTracker,
     /// Tracks if snapshot has been received for a symbol from level2 channel.
     level2_symbol_status: HashMap<String, bool>,
 }
@@ -41,23 +42,20 @@ impl MarketDataStream {
         Self {
             ev_tx,
             symbol_rx,
-            heartbeat_channel_tracker: ChannelSeqTracker::new("heartbeat"),
-            level2_channel_tracker: ChannelSeqTracker::new("level2"),
+            subscription_tracker: SubscriptionTracker::new(),
             level2_symbol_status: Default::default(),
         }
     }
 
-    // TODO: decorate Error.
     pub async fn connect(
         &mut self,
         key_name: &str,
         key_secret: &str,
         url: &str,
-    ) -> Result<(), Error> {
-        let request = url.into_client_request()?;
-        let (ws_stream, _) = connect_async(request).await?;
+    ) -> Result<(), CoinbaseError> {
+        let request = url.into_client_request().map_err(Box::new)?;
+        let (ws_stream, _) = connect_async(request).await.map_err(Box::new)?;
         let (mut write, mut read) = ws_stream.split();
-        let mut last_heartbeat: Option<DateTime<Utc>> = None;
 
         // TODO: handle jwt expire?
         let jwt = sign_es256(key_name, key_secret);
@@ -73,58 +71,67 @@ impl MarketDataStream {
                 )
                 .into(),
             ))
-            .await?;
+            .await
+            .map_err(Box::new)?;
 
         loop {
             select! {
-                symbol_msg = self.symbol_rx.recv() => match symbol_msg{
-                    Ok(symbol) => {
-                        write.send(Message::Text(
-                            format!(
-                                r#"{{
-                                    "type": "subscribe",
-                                    "product_ids": ["{symbol}"],
-                                    "channel": "level2",
-                                    "jwt": "{jwt}"
+                symbol_msg = self.symbol_rx.recv() => {
+                    match symbol_msg {
+                        Ok(symbol) => {
+                            write.send(Message::Text(
+                                format!(
+                                    r#"{{
+                                        "type": "subscribe",
+                                        "product_ids": ["{symbol}"],
+                                        "channel": "level2",
+                                        "jwt": "{jwt}"
                                     }}"#
-                            )
-                            .into()
-                        )).await?;
-                    }
-                    Err(RecvError::Closed) => {
-                        return Ok(());
-                    }
-                    Err(RecvError::Lagged(num)) => {
-                        error!("{num} subscription requests were missed.");
+                                )
+                                .into(),
+                            ))
+                            .await
+                            .map_err(Box::new)?;
+                        },
+                        Err(RecvError::Closed) => {
+                            return Ok(());
+                        },
+                        Err(RecvError::Lagged(num)) => {
+                            return Err(CoinbaseError::SubscriptionRequestMissed(
+                                format!("{num} Subscription requests were missed.")
+                            ));
+                        },
                     }
                 },
-                // Handle websocket market data stream.
-                ws_msg = read.next() => match ws_msg {
-                    Some(Ok(Message::Text(text))) => {
-                        self.process_text_messages(text.to_string());
+                ws_msg = read.next() => {
+                    match ws_msg {
+                        Some(Ok(Message::Text(text))) => {
+                            self.process_text_messages(text.to_string())?;
+                        },
+                        Some(Ok(Message::Ping(data))) => {
+                            write.send(Message::Pong(data)).await.map_err(Box::new)?;
+                        },
+                        Some(Ok(Message::Close(close_frame))) => {
+                            return Err(CoinbaseError::ConnectionAbort(
+                                format!("Websocket closed: {close_frame:?}")
+                           ));
+                        },
+                        Some(Ok(Message::Binary(_)))
+                        | Some(Ok(Message::Frame(_)))
+                        | Some(Ok(Message::Pong(_))) => {},
+                        Some(Err(error)) => {
+                            return Err(CoinbaseError::from(Box::new(error)));
+                        },
+                        None => {
+                            return Err(CoinbaseError::ConnectionInterrupted);
+                        },
                     }
-                    Some(Ok(Message::Ping(data))) =>  {
-                        write.send(Message::Pong(data)).await?;
-                        // last_ping = Instant::now();
-                    }
-                    Some(Ok(Message::Close(close_frame))) => {
-                        // TODO: handle error
-                    }
-                    Some( Ok(Message::Binary(_)))
-                    | Some(Ok(Message::Frame(_)))
-                    | Some(Ok(Message::Pong(_))) => {}
-                    Some(Err(error)) => {
-                        // TODO: handle error
-                    }
-                    None => {
-                        // TODO: handle error
-                    }
-                }
+                },
             }
         }
     }
 
-    fn process_text_messages(&mut self, text: String) {
+    fn process_text_messages(&mut self, text: String) -> Result<(), CoinbaseError> {
         match serde_json::from_str::<Stream>(&text) {
             Ok(Stream::Subscriptions { events }) => {
                 for event in events {
@@ -136,26 +143,32 @@ impl MarketDataStream {
                         );
                     }
                 }
+                Ok(())
             }
             Ok(Stream::Heartbeat(heartbeat)) => {
-                self.heartbeat_channel_tracker.track(heartbeat.sequence_num);
+                self.subscription_tracker
+                    .track("heartbeat", heartbeat.sequence_num);
                 if heartbeat.events.len() != 1 {
-                    error!("invalid heartbeat received")
+                    return Err(CoinbaseError::WebSocketStreamError(format!(
+                        "Invalid heartbeat {heartbeat:?}"
+                    )));
                 }
-                debug!("receive heartbeat {:?}", heartbeat.events[0])
-                // self..track(data.sequence_num);
+                Ok(())
             }
-            Ok(Stream::Level2(level2)) => {
-                self.process_level2_channel(level2);
-            }
-            Err(error) => {
-                error!(?error, %text, "Couldn't parse Stream.");
-            }
+            Ok(Stream::Level2(level2)) => self.process_level2_channel(level2),
+            // TODO: handle authentication failure
+            // {"type":"error","message":"authentication failure"}
+            Err(error) => Err(CoinbaseError::WebSocketStreamError(format!(
+                "Couldn't parse Stream {text}: {error}"
+            ))),
         }
     }
 
-    fn process_level2_channel(&mut self, data: ChannelMessage<Level2>) {
-        self.level2_channel_tracker.track(data.sequence_num);
+    fn process_level2_channel(
+        &mut self,
+        data: ChannelMessage<Level2>,
+    ) -> Result<(), CoinbaseError> {
+        self.subscription_tracker.track("level2", data.sequence_num);
 
         for event in data.events {
             let symbol = &event.product_id;
@@ -172,6 +185,8 @@ impl MarketDataStream {
                 continue;
             }
 
+            // TODO: when connector is killed sending messages here would panic because receivers
+            // has been dropped, should refactor connector exit order
             self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
             for update in event.updates {
                 let depth_ev = match update.side {
@@ -197,26 +212,25 @@ impl MarketDataStream {
             }
             self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
         }
+        Ok(())
     }
 }
 
-/// Tracks message sequence numbers for a given channel,
+/// Tracks message sequence numbers for a given Websocket subscription,
 /// logging any out-of-order or missing (dropped) messages.
-struct ChannelSeqTracker {
-    name: &'static str,
+/// // TODO: track heartbeat timestamp.
+struct SubscriptionTracker {
     prev_seq: Option<u64>,
 }
 
-impl ChannelSeqTracker {
-    fn new(name: &'static str) -> Self {
-        ChannelSeqTracker {
-            name,
-            prev_seq: None,
-        }
+impl SubscriptionTracker {
+    fn new() -> Self {
+        SubscriptionTracker { prev_seq: None }
     }
 
-    /// Feed in the next sequence number. Logs out-of-order events or dropped messages.
-    fn track(&mut self, seq: u64) {
+    /// Feed in the message's channel and its sequence number, logs out-of-order events or
+    /// dropped messages.
+    fn track(&mut self, channel: &str, seq: u64) {
         match self.prev_seq {
             None => {
                 // first message for channel
@@ -229,21 +243,21 @@ impl ChannelSeqTracker {
             Some(prev) if seq <= prev => {
                 // message out of order
                 debug!(
-                    channel = %self.name,
+                    channel = channel,
                     expected = prev + 1,
-                    actual   = seq,
+                    actual = seq,
                     "out-of-order sequence"
                 );
             }
             Some(prev) => {
                 // gap detected
+                // TODO: figure out how to handle gaps
                 error!(
-                    channel  = %self.name,
+                    channel = channel,
                     expected = prev + 1,
-                    actual   = seq,
+                    actual = seq,
                     "sequence gap detected, there is dropped message",
                 );
-                // TODO: dropped message should trigger re-subscription
                 self.prev_seq = Some(seq);
             }
         }
@@ -280,9 +294,7 @@ fn sign_es256(key_name: &str, key_secret: &str) -> String {
     let encoding_key = EncodingKey::from_ec_pem(key_secret.as_bytes()).unwrap();
 
     // Encode the token using ES256 and your EC key
-    let token = encode(&header, &claims, &encoding_key).unwrap();
-
-    return token;
+    encode(&header, &claims, &encoding_key).unwrap()
 }
 
 #[cfg(test)]
@@ -294,7 +306,6 @@ mod tests {
     };
     use serde_json::json;
     use tokio::sync::{broadcast, mpsc};
-    use tracing::debug;
 
     use crate::{coinbase::market_data_stream::MarketDataStream, connector::PublishEvent};
 
@@ -367,19 +378,25 @@ mod tests {
         .to_string();
 
         // Verify update before snapshot is ignored.
-        stream.process_text_messages(update);
+        assert!(
+            stream.process_text_messages(update).is_ok(),
+            "expect no error"
+        );
         assert!(
             rx.try_recv().is_err(),
             "Expect no PublishEvent for update before snapshot"
         );
         assert_eq!(
             Some(1),
-            stream.level2_channel_tracker.prev_seq,
+            stream.subscription_tracker.prev_seq,
             "expect sequence number tracked"
         );
 
         // Verify snapshot is processed.
-        stream.process_text_messages(snapshot);
+        assert!(
+            stream.process_text_messages(snapshot).is_ok(),
+            "expect no error"
+        );
         match rx.try_recv().unwrap() {
             PublishEvent::BatchStart(dest) => assert_eq!(dest, TO_ALL),
             other => panic!("expect BatchStart, got {other:?}"),
@@ -408,7 +425,7 @@ mod tests {
         }
         assert_eq!(
             Some(2),
-            stream.level2_channel_tracker.prev_seq,
+            stream.subscription_tracker.prev_seq,
             "expect sequence number tracked"
         );
     }

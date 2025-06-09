@@ -10,10 +10,12 @@ use std::{
 use anyhow::Error;
 use hftbacktest::types::Order;
 use serde::Deserialize;
+use thiserror::Error;
 use tokio::sync::{
     broadcast::{self, Sender},
     mpsc::UnboundedSender,
 };
+use tokio_tungstenite::tungstenite;
 use tracing::error;
 
 use crate::{
@@ -21,6 +23,21 @@ use crate::{
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
     utils::{ExponentialBackoff, Retry},
 };
+
+#[derive(Error, Debug)]
+// TODO: implement From<CoinbaseError> for Value for implicit conversion.
+pub enum CoinbaseError {
+    #[error("SubscriptionRequestMissed: {0}")]
+    SubscriptionRequestMissed(String),
+    #[error("WebsocketStreamError: {0}")]
+    WebSocketStreamError(String),
+    #[error("ConnectionAbort: {0}")]
+    ConnectionAbort(String),
+    #[error("Tunstenite: {0:?}")]
+    Tunstenite(#[from] Box<tungstenite::Error>),
+    #[error("ConnectionInterrupted")]
+    ConnectionInterrupted,
+}
 
 #[derive(Deserialize)]
 pub struct Config {
