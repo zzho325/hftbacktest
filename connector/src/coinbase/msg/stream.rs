@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Deserializer, de::Error as DeError};
+use serde::{Deserialize, Deserializer};
 
 use crate::utils::from_str_to_f64;
 
@@ -55,14 +55,14 @@ pub struct L2Update {
 
 #[derive(Deserialize, Debug)]
 pub struct Heartbeat {
-    #[serde(deserialize_with = "deserialize_heartbeat_timestamp")]
+    #[serde(deserialize_with = "from_heartbeat_ts_to_datetime")]
     pub current_time: DateTime<Utc>,
     pub heartbeat_counter: u64,
 }
 
 /// Deserialize heartbeat current_time of format
 /// "2025-06-06 07:01:53.305743326 +0000 UTC m=+27862.572888510".
-fn deserialize_heartbeat_timestamp<'de, D>(d: D) -> Result<DateTime<Utc>, D::Error>
+fn from_heartbeat_ts_to_datetime<'de, D>(d: D) -> Result<DateTime<Utc>, D::Error>
 where
     D: Deserializer<'de>,
 {

@@ -36,7 +36,7 @@ pub enum CoinbaseError {
     #[error("Tunstenite: {0:?}")]
     Tunstenite(#[from] Box<tungstenite::Error>),
     #[error("ConnectionInterrupted")]
-    ConnectionInterrupted,
+    ConnectionInterrupted(String),
 }
 
 #[derive(Deserialize)]

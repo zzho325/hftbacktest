@@ -1,6 +1,9 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use futures_util::{SinkExt, StreamExt};
 use hftbacktest::{
     live::ipc::TO_ALL,
@@ -14,6 +17,7 @@ use tokio::{
         broadcast::{Receiver, error::RecvError},
         mpsc::UnboundedSender,
     },
+    time,
 };
 use tokio_tungstenite::{
     connect_async,
@@ -38,6 +42,9 @@ pub struct MarketDataStream {
 }
 
 impl MarketDataStream {
+    // Coinbase sends heartbeats per second, errors out when no heartbeat is received for 2 sec.
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
     pub fn new(ev_tx: UnboundedSender<PublishEvent>, symbol_rx: Receiver<String>) -> Self {
         Self {
             ev_tx,
@@ -74,8 +81,21 @@ impl MarketDataStream {
             .await
             .map_err(Box::new)?;
 
+        let mut heartbeat_interval = time::interval(Self::HEARTBEAT_INTERVAL);
+        heartbeat_interval.tick().await; // skip first tick
+        let mut last_heartbeat: Option<Instant> = None;
+
         loop {
             select! {
+                _ = heartbeat_interval.tick()  => {
+                    if last_heartbeat
+                        .map(|t| t.elapsed() > Self::HEARTBEAT_INTERVAL)
+                        .unwrap_or(true) {
+                            return Err(CoinbaseError::ConnectionInterrupted(
+                                "missing heartbeats".to_string()
+                            ));
+                    }
+                },
                 symbol_msg = self.symbol_rx.recv() => {
                     match symbol_msg {
                         Ok(symbol) => {
@@ -106,7 +126,7 @@ impl MarketDataStream {
                 ws_msg = read.next() => {
                     match ws_msg {
                         Some(Ok(Message::Text(text))) => {
-                            self.process_text_messages(text.to_string())?;
+                            self.process_text_messages(text.to_string(), &mut last_heartbeat)?;
                         },
                         Some(Ok(Message::Ping(data))) => {
                             write.send(Message::Pong(data)).await.map_err(Box::new)?;
@@ -123,7 +143,9 @@ impl MarketDataStream {
                             return Err(CoinbaseError::from(Box::new(error)));
                         },
                         None => {
-                            return Err(CoinbaseError::ConnectionInterrupted);
+                            return Err(CoinbaseError::ConnectionInterrupted(
+                                "No websocket message".to_string()
+                            ));
                         },
                     }
                 },
@@ -131,7 +153,11 @@ impl MarketDataStream {
         }
     }
 
-    fn process_text_messages(&mut self, text: String) -> Result<(), CoinbaseError> {
+    fn process_text_messages(
+        &mut self,
+        text: String,
+        last_heartbeat: &mut Option<Instant>,
+    ) -> Result<(), CoinbaseError> {
         match serde_json::from_str::<Stream>(&text) {
             Ok(Stream::Subscriptions { events }) => {
                 for event in events {
@@ -147,11 +173,25 @@ impl MarketDataStream {
             }
             Ok(Stream::Heartbeat(heartbeat)) => {
                 self.subscription_tracker
-                    .track("heartbeat", heartbeat.sequence_num);
+                    .track_seq("heartbeat", heartbeat.sequence_num);
                 if heartbeat.events.len() != 1 {
                     return Err(CoinbaseError::WebSocketStreamError(format!(
                         "Invalid heartbeat {heartbeat:?}"
                     )));
+                }
+                let event = &heartbeat.events[0];
+                self.subscription_tracker
+                    .track_heartbeat_counter(event.heartbeat_counter);
+                *last_heartbeat = Some(Instant::now());
+                // Error out if heartbeat timestamp > 2 seconds behind.
+                let now_utc = chrono::Utc::now();
+                let age = now_utc.signed_duration_since(event.current_time);
+                if age > TimeDelta::from_std(Self::HEARTBEAT_INTERVAL).unwrap() {
+                    // TODO: error out after extracting clock.
+                    // return Err(CoinbaseError::WebSocketStreamError(format!(
+                    //     "Heartbeat is {} seconds old!",
+                    //     age.num_seconds()
+                    // )));
                 }
                 Ok(())
             }
@@ -168,7 +208,8 @@ impl MarketDataStream {
         &mut self,
         data: ChannelMessage<Level2>,
     ) -> Result<(), CoinbaseError> {
-        self.subscription_tracker.track("level2", data.sequence_num);
+        self.subscription_tracker
+            .track_seq("level2", data.sequence_num);
 
         for event in data.events {
             let symbol = &event.product_id;
@@ -216,55 +257,65 @@ impl MarketDataStream {
     }
 }
 
-/// Tracks message sequence numbers for a given Websocket subscription,
-/// logging any out-of-order or missing (dropped) messages.
-/// // TODO: track heartbeat timestamp.
+/// Tracks missing messages for a websocket subscription with sequence numbers and heartbeat
+/// counter, logging any out-of-order or missing (dropped) messages.
 struct SubscriptionTracker {
     prev_seq: Option<u64>,
+    prev_heartbeat_counter: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceStatus {
+    InOrder,
+    OutOfOrder { expected: u64, actual: u64 },
+    GapDetected { expected: u64, actual: u64 },
 }
 
 impl SubscriptionTracker {
     fn new() -> Self {
-        SubscriptionTracker { prev_seq: None }
+        SubscriptionTracker {
+            prev_seq: None,
+            prev_heartbeat_counter: None,
+        }
     }
 
-    /// Feed in the message's channel and its sequence number, logs out-of-order events or
-    /// dropped messages.
-    fn track(&mut self, channel: &str, seq: u64) {
-        match self.prev_seq {
-            None => {
-                // first message for channel
-                self.prev_seq = Some(seq);
-            }
-            Some(prev) if seq == prev + 1 => {
-                // sequence in order
-                self.prev_seq = Some(seq);
-            }
-            Some(prev) if seq <= prev => {
-                // message out of order
-                debug!(
-                    channel = channel,
-                    expected = prev + 1,
-                    actual = seq,
-                    "out-of-order sequence"
-                );
-            }
-            Some(prev) => {
-                // gap detected
-                // TODO: figure out how to handle gaps
-                error!(
-                    channel = channel,
-                    expected = prev + 1,
-                    actual = seq,
-                    "sequence gap detected, there is dropped message",
-                );
-                self.prev_seq = Some(seq);
-            }
+    /// Feed in the message's channel and its sequence number, logs out-of-order or dropped
+    /// messages.
+    fn track_seq(&mut self, channel: &str, seq: u64) {
+        let status = Self::track(&mut self.prev_seq, seq);
+        if status != SequenceStatus::InOrder {
+            // TODO: figure out how to handle
+            debug!("{channel} message not in sequence: {status:?}");
+        }
+    }
+
+    /// Feed in the heartbeat counter. logs out-of-order or dropped heartbeats.
+    fn track_heartbeat_counter(&mut self, counter: u64) {
+        let status = Self::track(&mut self.prev_heartbeat_counter, counter);
+        if status != SequenceStatus::InOrder {
+            // TODO: figure out how to handle
+            debug!("heartbeat counter not in sequence: {status:?}");
+        }
+    }
+
+    fn track(prev: &mut Option<u64>, cur: u64) -> SequenceStatus {
+        let expected = prev.map(|p| p + 1);
+        *prev = Some(cur);
+        match expected {
+            Some(expected) if cur < expected => SequenceStatus::OutOfOrder {
+                expected,
+                actual: cur,
+            },
+            Some(expected) if cur > expected => SequenceStatus::GapDetected {
+                expected,
+                actual: cur,
+            },
+            _ => SequenceStatus::InOrder,
         }
     }
 }
 
-// Defines the JWT claims
+/// Defines the JWT claims
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     sub: String,
@@ -299,6 +350,8 @@ fn sign_es256(key_name: &str, key_secret: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use chrono::DateTime;
     use hftbacktest::{
         live::ipc::TO_ALL,
@@ -310,10 +363,11 @@ mod tests {
     use crate::{coinbase::market_data_stream::MarketDataStream, connector::PublishEvent};
 
     #[tokio::test]
-    async fn test_process_text_messages_level2() {
+    async fn process_level2_messages() {
         let (tx, mut rx) = mpsc::unbounded_channel::<PublishEvent>();
         let (_sym_tx, sym_rx) = broadcast::channel(1);
         let mut stream = MarketDataStream::new(tx, sym_rx);
+        let mut last_heartbeat: Option<Instant> = None;
 
         let test_ts = "2025-06-01T20:32:50Z";
         let test_ts_nano = DateTime::parse_from_rfc3339(test_ts)
@@ -378,10 +432,10 @@ mod tests {
         .to_string();
 
         // Verify update before snapshot is ignored.
-        assert!(
-            stream.process_text_messages(update).is_ok(),
-            "expect no error"
-        );
+        stream
+            .process_text_messages(update, &mut last_heartbeat)
+            .expect("expect no error");
+
         assert!(
             rx.try_recv().is_err(),
             "Expect no PublishEvent for update before snapshot"
@@ -393,10 +447,10 @@ mod tests {
         );
 
         // Verify snapshot is processed.
-        assert!(
-            stream.process_text_messages(snapshot).is_ok(),
-            "expect no error"
-        );
+        stream
+            .process_text_messages(snapshot, &mut last_heartbeat)
+            .expect("expect no error");
+
         match rx.try_recv().unwrap() {
             PublishEvent::BatchStart(dest) => assert_eq!(dest, TO_ALL),
             other => panic!("expect BatchStart, got {other:?}"),
@@ -427,6 +481,44 @@ mod tests {
             Some(2),
             stream.subscription_tracker.prev_seq,
             "expect sequence number tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_heartbeats() {
+        let (tx, _) = mpsc::unbounded_channel::<PublishEvent>();
+        let (_sym_tx, sym_rx) = broadcast::channel(1);
+        let mut stream = MarketDataStream::new(tx, sym_rx);
+        let mut last_heartbeat: Option<Instant> = None;
+
+        let heartbeat_ts = "2025-06-01 20:32:50.121961769 +0000 UTC";
+        let heartbeat = json!({
+          "channel": "heartbeats",
+          "client_id": "",
+          "timestamp": "2023-06-23T20:31:26.122969572Z",
+          "sequence_num": 1,
+          "events": [
+            {
+              "current_time": format!("{heartbeat_ts} m=+91717.525857105"),
+              "heartbeat_counter": 3049
+            }
+          ]
+        })
+        .to_string();
+
+        stream
+            .process_text_messages(heartbeat, &mut last_heartbeat)
+            .expect("expect no error");
+
+        assert_eq!(
+            Some(1),
+            stream.subscription_tracker.prev_seq,
+            "expect sequence number tracked"
+        );
+        assert_eq!(
+            Some(3049),
+            stream.subscription_tracker.prev_heartbeat_counter,
+            "expect heartbeat counter tracked"
         );
     }
 }
