@@ -29,7 +29,7 @@ use crate::{
 pub enum CoinbaseError {
     #[error("SubscriptionRequestMissed: {0}")]
     SubscriptionRequestMissed(String),
-    #[error("WebsocketStreamError: {0}")]
+    #[error("WebSocketStreamError: {0}")]
     WebSocketStreamError(String),
     #[error("ConnectionAbort: {0}")]
     ConnectionAbort(String),
