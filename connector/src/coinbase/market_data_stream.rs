@@ -3,7 +3,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{TimeDelta, Utc};
 use futures_util::{SinkExt, StreamExt};
 use hftbacktest::{
     live::ipc::TO_ALL,
@@ -34,12 +33,13 @@ use crate::{
     coinbase::{
         CoinbaseError,
         msg::stream::{BookSide, ChannelMessage, Level2, Side, Stream, Trade},
-        utils,
+        utils::{self, Clock},
     },
     connector::PublishEvent,
 };
 
 pub struct MarketDataStream {
+    utc_clock: Box<dyn Clock>,
     ev_tx: UnboundedSender<PublishEvent>,
     symbol_rx: Receiver<String>,
     subscription_tracker: SubscriptionTracker,
@@ -53,11 +53,18 @@ impl MarketDataStream {
 
     pub fn new(ev_tx: UnboundedSender<PublishEvent>, symbol_rx: Receiver<String>) -> Self {
         Self {
+            utc_clock: Box::new(utils::SystemClock),
             ev_tx,
             symbol_rx,
             subscription_tracker: SubscriptionTracker::new(),
             level2_symbol_status: Default::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_clock(mut self, clock: Box<dyn Clock>) -> Self {
+        self.utc_clock = clock;
+        self
     }
 
     pub async fn connect(
@@ -71,7 +78,7 @@ impl MarketDataStream {
         let (mut write, mut read) = ws_stream.split();
 
         // TODO: handle jwt expire?
-        let jwt = utils::sign_es256(key_name, key_secret);
+        let jwt = utils::sign_es256(&*self.utc_clock, key_name, key_secret);
         // Subscribe to heartbeat.
         utils::subscribe_ws(&mut write, "heartbeats", None, &jwt)
             .await
@@ -173,14 +180,13 @@ impl MarketDataStream {
                     .track_heartbeat_counter(event.heartbeat_counter);
                 *last_heartbeat = Some(Instant::now());
                 // Error out if heartbeat timestamp > 2 seconds behind.
-                let now_utc = chrono::Utc::now();
+                let now_utc = self.utc_clock.now();
                 let age = now_utc.signed_duration_since(event.current_time);
-                if age > TimeDelta::from_std(Self::HEARTBEAT_INTERVAL).unwrap() {
-                    // TODO: error out after extracting clock.
-                    // return Err(CoinbaseError::WebSocketStreamError(format!(
-                    //     "Heartbeat is {} seconds old!",
-                    //     age.num_seconds()
-                    // )));
+                if age > chrono::TimeDelta::from_std(Self::HEARTBEAT_INTERVAL).unwrap() {
+                    return Err(CoinbaseError::WebSocketStreamError(format!(
+                        "Heartbeat is {} seconds old!",
+                        age.num_seconds()
+                    )));
                 }
                 Ok(())
             }
@@ -231,7 +237,7 @@ impl MarketDataStream {
                         event: Event {
                             ev: depth_ev,
                             exch_ts: update.event_time.timestamp_nanos_opt().unwrap(),
-                            local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                            local_ts: self.utc_clock.now().timestamp_nanos_opt().unwrap(),
                             order_id: 0,
                             px: update.price_level,
                             qty: update.new_quantity,
@@ -262,7 +268,7 @@ impl MarketDataStream {
                         event: Event {
                             ev: trade_ev,
                             exch_ts: trade.time.timestamp_nanos_opt().unwrap(),
-                            local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                            local_ts: self.utc_clock.now().timestamp_nanos_opt().unwrap(),
                             order_id: 0,
                             px: trade.price,
                             qty: trade.size,
@@ -340,7 +346,7 @@ impl SubscriptionTracker {
 mod tests {
     use std::time::Instant;
 
-    use chrono::DateTime;
+    use chrono::{DateTime, Duration};
     use hftbacktest::{
         live::ipc::TO_ALL,
         types::{LOCAL_ASK_DEPTH_EVENT, LOCAL_BID_DEPTH_EVENT, LOCAL_BUY_TRADE_EVENT, LiveEvent},
@@ -348,7 +354,10 @@ mod tests {
     use serde_json::json;
     use tokio::sync::{broadcast, mpsc};
 
-    use crate::{coinbase::market_data_stream::MarketDataStream, connector::PublishEvent};
+    use crate::{
+        coinbase::{market_data_stream::MarketDataStream, utils::testutils::MockClock},
+        connector::PublishEvent,
+    };
 
     #[tokio::test]
     async fn process_level2_messages() {
@@ -539,10 +548,16 @@ mod tests {
     async fn process_heartbeats() {
         let (tx, _) = mpsc::unbounded_channel::<PublishEvent>();
         let (_sym_tx, sym_rx) = broadcast::channel(1);
-        let mut stream = MarketDataStream::new(tx, sym_rx);
+        let heartbeat_ts = "2025-06-01 20:32:50.121961769 +0000 UTC";
+        let heartbeat_dt = DateTime::parse_from_str(heartbeat_ts, "%Y-%m-%d %H:%M:%S%.f %z UTC")
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap();
+
+        let mock_clock = MockClock::new(heartbeat_dt);
+        let clock_clone = mock_clock.clone();
+        let mut stream = MarketDataStream::new(tx, sym_rx).with_clock(Box::new(clock_clone));
         let mut last_heartbeat: Option<Instant> = None;
 
-        let heartbeat_ts = "2025-06-01 20:32:50.121961769 +0000 UTC";
         let heartbeat = json!({
           "channel": "heartbeats",
           "client_id": "",
@@ -557,6 +572,7 @@ mod tests {
         })
         .to_string();
 
+        mock_clock.set_time(heartbeat_dt + Duration::seconds(1));
         stream
             .process_text_messages(heartbeat, &mut last_heartbeat)
             .expect("expect no error");
@@ -571,5 +587,29 @@ mod tests {
             stream.subscription_tracker.prev_heartbeat_counter,
             "expect heartbeat counter tracked"
         );
+
+        // Heartbeat with old timestamp.
+        let heartbeat2 = json!({
+          "channel": "heartbeats",
+          "client_id": "",
+          "timestamp": "2023-06-23T20:31:26.122969572Z",
+          "sequence_num": 2,
+          "events": [
+            {
+              "current_time": format!("{heartbeat_ts} m=+91717.525857105"),
+              "heartbeat_counter": 3050
+            }
+          ]
+        })
+        .to_string();
+
+        mock_clock.set_time(heartbeat_dt + Duration::seconds(3));
+
+        assert!(
+            stream
+                .process_text_messages(heartbeat2, &mut last_heartbeat)
+                .is_err(),
+            "expect stale heartbeat error"
+        )
     }
 }

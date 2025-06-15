@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
@@ -23,6 +23,53 @@ pub async fn subscribe_ws(
     ws_write.send(Message::Text(msg.to_string().into())).await
 }
 
+/// A trait that abstracts access to the current UTC time so that time can me mocked for testing.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> DateTime<Utc>;
+}
+
+/// The default system implementation of [`Clock`] that returns `Utc::now()`.
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
+#[cfg(test)]
+pub mod testutils {
+    use std::sync::{Arc, Mutex};
+
+    use chrono::{DateTime, Utc};
+
+    use crate::coinbase::utils::Clock;
+
+    /// Mock implementation of [`Clock`] for testing.
+    #[derive(Clone)]
+    pub struct MockClock {
+        time: Arc<Mutex<DateTime<Utc>>>,
+    }
+
+    impl MockClock {
+        pub fn new(initial: DateTime<Utc>) -> Self {
+            Self {
+                time: Arc::new(Mutex::new(initial)),
+            }
+        }
+
+        pub fn set_time(&self, new_time: DateTime<Utc>) {
+            *self.time.lock().unwrap() = new_time;
+        }
+    }
+
+    impl Clock for MockClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self.time.lock().unwrap()
+        }
+    }
+}
+
 /// Defines the JWT claims
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -32,13 +79,13 @@ struct Claims {
     exp: usize,
 }
 
-pub fn sign_es256(key_name: &str, key_secret: &str) -> String {
+pub fn sign_es256(clock: &dyn Clock, key_name: &str, key_secret: &str) -> String {
     // Build JWT header with ES256, kid
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
     header.kid = Some(key_name.to_string());
 
     // Set issued-at and expiration (2 min) timestamps
-    let iat = Utc::now().timestamp() as usize;
+    let iat = clock.now().timestamp() as usize;
     let exp = iat + 120;
 
     // Create the claims
