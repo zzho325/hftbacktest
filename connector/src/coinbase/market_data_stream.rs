@@ -32,7 +32,7 @@ use tracing::{debug, error};
 use crate::{
     coinbase::{
         CoinbaseError,
-        msg::stream::{BookSide, ChannelMessage, Level2, Side, Stream, Trade},
+        msg::stream::{BookSide, Channel, ChannelMessage, Error, Level2, Side, Stream, Trade},
         utils::{self, Clock},
     },
     connector::PublishEvent,
@@ -77,7 +77,7 @@ impl MarketDataStream {
         let (ws_stream, _) = connect_async(request).await.map_err(Box::new)?;
         let (mut write, mut read) = ws_stream.split();
 
-        // TODO: handle jwt expire?
+        // TODO: handle "authentication failure" caused by jwt expiration
         let jwt = utils::sign_es256(&*self.utc_clock, key_name, key_secret);
         // Subscribe to heartbeat.
         utils::subscribe_ws(&mut write, "heartbeats", None, &jwt)
@@ -122,7 +122,7 @@ impl MarketDataStream {
                 ws_msg = read.next() => {
                     match ws_msg {
                         Some(Ok(Message::Text(text))) => {
-                            self.process_text_messages(text.to_string(), &mut last_heartbeat)?;
+                            self.process_ws_stream(text.to_string(), &mut last_heartbeat)?;
                         },
                         Some(Ok(Message::Ping(data))) => {
                             write.send(Message::Pong(data)).await.map_err(Box::new)?;
@@ -149,13 +149,13 @@ impl MarketDataStream {
         }
     }
 
-    fn process_text_messages(
+    fn process_ws_stream(
         &mut self,
-        text: String,
+        steam_msg: String,
         last_heartbeat: &mut Option<Instant>,
     ) -> Result<(), CoinbaseError> {
-        match serde_json::from_str::<Stream>(&text) {
-            Ok(Stream::Subscriptions { events }) => {
+        match serde_json::from_str::<Stream>(&steam_msg) {
+            Ok(Stream::Channel(Channel::Subscriptions { events })) => {
                 for event in events {
                     for (sub_key, values) in event.subscriptions {
                         debug!(
@@ -167,7 +167,7 @@ impl MarketDataStream {
                 }
                 Ok(())
             }
-            Ok(Stream::Heartbeat(heartbeat)) => {
+            Ok(Stream::Channel(Channel::Heartbeat(heartbeat))) => {
                 self.subscription_tracker
                     .track_seq("heartbeat", heartbeat.sequence_num);
                 if heartbeat.events.len() != 1 {
@@ -190,12 +190,13 @@ impl MarketDataStream {
                 }
                 Ok(())
             }
-            Ok(Stream::Level2(level2)) => self.process_level2_channel(level2),
-            Ok(Stream::Trade(trade)) => self.process_trade_channel(trade),
-            // TODO: handle authentication failure
-            // {"type":"error","message":"authentication failure"}
-            Err(error) => Err(CoinbaseError::WebSocketStreamError(format!(
-                "Couldn't parse Stream {text}: {error}"
+            Ok(Stream::Channel(Channel::Level2(level2))) => self.process_level2_channel(level2),
+            Ok(Stream::Channel(Channel::Trade(trade))) => self.process_trade_channel(trade),
+            Ok(Stream::Error(Error::ErrorMessage { message })) => {
+                Err(CoinbaseError::WebSocketStreamError(message))
+            }
+            Err(err) => Err(CoinbaseError::WebSocketStreamError(format!(
+                "Couldn't parse message {steam_msg}: {err}"
             ))),
         }
     }
@@ -355,7 +356,11 @@ mod tests {
     use tokio::sync::{broadcast, mpsc};
 
     use crate::{
-        coinbase::{market_data_stream::MarketDataStream, utils::testutils::MockClock},
+        coinbase::{
+            CoinbaseError,
+            market_data_stream::MarketDataStream,
+            utils::testutils::MockClock,
+        },
         connector::PublishEvent,
     };
 
@@ -430,7 +435,7 @@ mod tests {
 
         // Verify update before snapshot is ignored.
         stream
-            .process_text_messages(update, &mut last_heartbeat)
+            .process_ws_stream(update, &mut last_heartbeat)
             .expect("expect no error");
 
         assert!(
@@ -445,7 +450,7 @@ mod tests {
 
         // Verify snapshot is processed.
         stream
-            .process_text_messages(snapshot, &mut last_heartbeat)
+            .process_ws_stream(snapshot, &mut last_heartbeat)
             .expect("expect no error");
 
         match rx.try_recv().unwrap() {
@@ -517,7 +522,7 @@ mod tests {
         })
         .to_string();
         stream
-            .process_text_messages(trade, &mut last_heartbeat)
+            .process_ws_stream(trade, &mut last_heartbeat)
             .expect("expect no error");
 
         match rx.try_recv().unwrap() {
@@ -574,7 +579,7 @@ mod tests {
 
         mock_clock.set_time(heartbeat_dt + Duration::seconds(1));
         stream
-            .process_text_messages(heartbeat, &mut last_heartbeat)
+            .process_ws_stream(heartbeat, &mut last_heartbeat)
             .expect("expect no error");
 
         assert_eq!(
@@ -607,9 +612,27 @@ mod tests {
 
         assert!(
             stream
-                .process_text_messages(heartbeat2, &mut last_heartbeat)
+                .process_ws_stream(heartbeat2, &mut last_heartbeat)
                 .is_err(),
             "expect stale heartbeat error"
         )
+    }
+
+    #[tokio::test]
+    async fn process_authentication_failure() {
+        let (tx, _) = mpsc::unbounded_channel::<PublishEvent>();
+        let (_sym_tx, sym_rx) = broadcast::channel(1);
+        let mut stream = MarketDataStream::new(tx, sym_rx);
+        let mut last_heartbeat: Option<Instant> = None;
+        let error_msg = json!({"type":"error","message":"authentication failure"}).to_string();
+        let res = stream.process_ws_stream(error_msg, &mut last_heartbeat);
+        assert!(
+            matches!(
+                res,
+                Err(CoinbaseError::WebSocketStreamError(ref msg))
+                    if msg == "authentication failure",
+            ),
+            "expect Err(WebSocketStreamError(\"authentication failure\")), got {res:?}"
+        );
     }
 }

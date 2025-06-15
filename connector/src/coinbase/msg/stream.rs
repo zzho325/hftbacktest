@@ -4,8 +4,15 @@ use serde::{Deserialize, Deserializer};
 use crate::utils::from_str_to_f64;
 
 #[derive(Deserialize, Debug)]
-#[serde(tag = "channel")]
+#[serde(untagged)]
 pub enum Stream {
+    Channel(Channel),
+    Error(Error),
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "channel")]
+pub enum Channel {
     #[serde(rename = "subscriptions")]
     Subscriptions { events: Vec<SubscriptionEvent> },
     #[serde(rename = "l2_data")]
@@ -87,6 +94,13 @@ pub struct Heartbeat {
     #[serde(deserialize_with = "from_heartbeat_ts_to_datetime")]
     pub current_time: DateTime<Utc>,
     pub heartbeat_counter: u64,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum Error {
+    #[serde(rename = "error")]
+    ErrorMessage { message: String },
 }
 
 /// Deserialize heartbeat current_time of format
