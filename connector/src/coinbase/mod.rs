@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::Error;
-use hftbacktest::types::Order;
+use hftbacktest::types::{ErrorKind, LiveError, LiveEvent, Order, Value};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::{
@@ -26,7 +26,6 @@ use crate::{
 };
 
 #[derive(Error, Debug)]
-// TODO: implement From<CoinbaseError> for Value for implicit conversion.
 pub enum CoinbaseError {
     #[error("SubscriptionRequestMissed: {0}")]
     SubscriptionRequestMissed(String),
@@ -34,10 +33,16 @@ pub enum CoinbaseError {
     WebSocketStreamError(String),
     #[error("ConnectionAbort: {0}")]
     ConnectionAbort(String),
-    #[error("Tunstenite: {0:?}")]
-    Tunstenite(#[from] Box<tungstenite::Error>),
-    #[error("ConnectionInterrupted")]
+    #[error("WebSocketTransportError: {0:?}")]
+    WebSocketTransportError(#[from] Box<tungstenite::Error>),
+    #[error("ConnectionInterrupted: {0}")]
     ConnectionInterrupted(String),
+}
+
+impl From<CoinbaseError> for Value {
+    fn from(value: CoinbaseError) -> Value {
+        Value::String(value.to_string())
+    }
 }
 
 #[derive(Deserialize)]
@@ -86,12 +91,17 @@ impl Coinbase {
 
         tokio::spawn(async move {
             let _ = Retry::new(ExponentialBackoff::default())
-                .error_handler(|error: Error| {
+                .error_handler(|error: CoinbaseError| {
                     error!(
                         ?error,
                         "An error occurred in the market data stream connection."
                     );
-                    // TODO: handle error.
+                    ev_tx
+                        .send(PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
+                            ErrorKind::ConnectionInterrupted,
+                            error.into(),
+                        ))))
+                        .unwrap();
                     Ok(())
                 })
                 .retry(|| async {
