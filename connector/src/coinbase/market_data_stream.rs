@@ -16,8 +16,6 @@ use hftbacktest::{
         LiveEvent,
     },
 };
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use serde::{Deserialize, Serialize};
 use tokio::{
     select,
     sync::{
@@ -73,7 +71,7 @@ impl MarketDataStream {
         let (mut write, mut read) = ws_stream.split();
 
         // TODO: handle jwt expire?
-        let jwt = sign_es256(key_name, key_secret);
+        let jwt = utils::sign_es256(key_name, key_secret);
         // Subscribe to heartbeat.
         utils::subscribe_ws(&mut write, "heartbeats", None, &jwt)
             .await
@@ -336,39 +334,6 @@ impl SubscriptionTracker {
             _ => SequenceStatus::InOrder,
         }
     }
-}
-
-/// Defines the JWT claims
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    iss: String,
-    nbf: usize,
-    exp: usize,
-}
-
-fn sign_es256(key_name: &str, key_secret: &str) -> String {
-    // Build JWT header with ES256, kid
-    let mut header = Header::new(Algorithm::ES256);
-    header.kid = Some(key_name.to_string());
-
-    // Set issued-at and expiration (2 min) timestamps
-    let iat = Utc::now().timestamp() as usize;
-    let exp = iat + 120;
-
-    // Create the claims
-    let claims = Claims {
-        sub: key_name.to_string(),
-        iss: "cdp".to_string(),
-        nbf: iat,
-        exp,
-    };
-
-    // Encode the token
-    let encoding_key = EncodingKey::from_ec_pem(key_secret.as_bytes()).unwrap();
-
-    // Encode the token using ES256 and your EC key
-    encode(&header, &claims, &encoding_key).unwrap()
 }
 
 #[cfg(test)]
