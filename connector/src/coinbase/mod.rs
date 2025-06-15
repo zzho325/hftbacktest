@@ -1,6 +1,7 @@
 mod market_data_stream;
 mod msg;
 mod ordermanager;
+mod utils;
 
 use std::{
     collections::HashSet,

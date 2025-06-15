@@ -7,7 +7,14 @@ use chrono::{TimeDelta, Utc};
 use futures_util::{SinkExt, StreamExt};
 use hftbacktest::{
     live::ipc::TO_ALL,
-    types::{Event, LOCAL_ASK_DEPTH_EVENT, LOCAL_BID_DEPTH_EVENT, LiveEvent},
+    types::{
+        Event,
+        LOCAL_ASK_DEPTH_EVENT,
+        LOCAL_BID_DEPTH_EVENT,
+        LOCAL_BUY_TRADE_EVENT,
+        LOCAL_SELL_TRADE_EVENT,
+        LiveEvent,
+    },
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
@@ -28,7 +35,8 @@ use tracing::{debug, error};
 use crate::{
     coinbase::{
         CoinbaseError,
-        msg::stream::{ChannelMessage, Level2, Side, Stream},
+        msg::stream::{BookSide, ChannelMessage, Level2, Side, Stream, Trade},
+        utils,
     },
     connector::PublishEvent,
 };
@@ -67,17 +75,7 @@ impl MarketDataStream {
         // TODO: handle jwt expire?
         let jwt = sign_es256(key_name, key_secret);
         // Subscribe to heartbeat.
-        write
-            .send(Message::Text(
-                format!(
-                    r#"{{
-                            "type": "subscribe",
-                            "channel": "heartbeats",
-                            "jwt": "{jwt}"
-                        }}"#
-                )
-                .into(),
-            ))
+        utils::subscribe_ws(&mut write, "heartbeats", None, &jwt)
             .await
             .map_err(Box::new)?;
 
@@ -99,17 +97,10 @@ impl MarketDataStream {
                 symbol_msg = self.symbol_rx.recv() => {
                     match symbol_msg {
                         Ok(symbol) => {
-                            write.send(Message::Text(
-                                format!(
-                                    r#"{{
-                                        "type": "subscribe",
-                                        "product_ids": ["{symbol}"],
-                                        "channel": "level2",
-                                        "jwt": "{jwt}"
-                                    }}"#
-                                )
-                                .into(),
-                            ))
+                            utils::subscribe_ws(&mut write, "level2", Some(&symbol), &jwt)
+                            .await
+                            .map_err(Box::new)?;
+                            utils::subscribe_ws(&mut write, "market_trades", Some(&symbol), &jwt)
                             .await
                             .map_err(Box::new)?;
                         },
@@ -196,6 +187,7 @@ impl MarketDataStream {
                 Ok(())
             }
             Ok(Stream::Level2(level2)) => self.process_level2_channel(level2),
+            Ok(Stream::Trade(trade)) => self.process_trade_channel(trade),
             // TODO: handle authentication failure
             // {"type":"error","message":"authentication failure"}
             Err(error) => Err(CoinbaseError::WebSocketStreamError(format!(
@@ -231,8 +223,8 @@ impl MarketDataStream {
             self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
             for update in event.updates {
                 let depth_ev = match update.side {
-                    Side::Bid => LOCAL_BID_DEPTH_EVENT,
-                    Side::Ask => LOCAL_ASK_DEPTH_EVENT,
+                    BookSide::Bid => LOCAL_BID_DEPTH_EVENT,
+                    BookSide::Ask => LOCAL_ASK_DEPTH_EVENT,
                 };
 
                 self.ev_tx
@@ -245,6 +237,37 @@ impl MarketDataStream {
                             order_id: 0,
                             px: update.price_level,
                             qty: update.new_quantity,
+                            ival: 0,
+                            fval: 0.0,
+                        },
+                    }))
+                    .unwrap();
+            }
+            self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
+        }
+        Ok(())
+    }
+
+    fn process_trade_channel(&mut self, data: ChannelMessage<Trade>) -> Result<(), CoinbaseError> {
+        self.subscription_tracker
+            .track_seq("trade", data.sequence_num);
+        for event in data.events {
+            self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
+            for trade in event.trades {
+                let trade_ev = match trade.side {
+                    Side::Sell => LOCAL_SELL_TRADE_EVENT,
+                    Side::Buy => LOCAL_BUY_TRADE_EVENT,
+                };
+                self.ev_tx
+                    .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                        symbol: trade.product_id.clone(),
+                        event: Event {
+                            ev: trade_ev,
+                            exch_ts: trade.time.timestamp_nanos_opt().unwrap(),
+                            local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                            order_id: 0,
+                            px: trade.price,
+                            qty: trade.size,
                             ival: 0,
                             fval: 0.0,
                         },
@@ -355,7 +378,7 @@ mod tests {
     use chrono::DateTime;
     use hftbacktest::{
         live::ipc::TO_ALL,
-        types::{LOCAL_ASK_DEPTH_EVENT, LOCAL_BID_DEPTH_EVENT, LiveEvent},
+        types::{LOCAL_ASK_DEPTH_EVENT, LOCAL_BID_DEPTH_EVENT, LOCAL_BUY_TRADE_EVENT, LiveEvent},
     };
     use serde_json::json;
     use tokio::sync::{broadcast, mpsc};
@@ -482,6 +505,69 @@ mod tests {
             stream.subscription_tracker.prev_seq,
             "expect sequence number tracked"
         );
+    }
+
+    #[tokio::test]
+    async fn process_trade_messages() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<PublishEvent>();
+        let (_sym_tx, sym_rx) = broadcast::channel(1);
+        let mut stream = MarketDataStream::new(tx, sym_rx);
+        let mut last_heartbeat: Option<Instant> = None;
+
+        let test_ts = "2025-06-01T20:32:50Z";
+        let test_ts_nano = DateTime::parse_from_rfc3339(test_ts)
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+
+        let trade = json!({
+          "channel": "market_trades",
+          "client_id": "",
+          "timestamp": "2023-02-09T20:19:35.39625135Z",
+          "sequence_num": 2,
+          "events": [
+            {
+              "type": "snapshot",
+              "trades": [
+                {
+                  "trade_id": "000000000",
+                  "product_id": "ETH-USD",
+                  "price": "1260.01",
+                  "size": "0.3",
+                  "side": "BUY",
+                  "time": test_ts
+                }
+              ]
+            }
+          ]
+        })
+        .to_string();
+        stream
+            .process_text_messages(trade, &mut last_heartbeat)
+            .expect("expect no error");
+
+        match rx.try_recv().unwrap() {
+            PublishEvent::BatchStart(dest) => assert_eq!(dest, TO_ALL),
+            other => panic!("expect BatchStart, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            PublishEvent::LiveEvent(LiveEvent::Feed { event, .. }) => {
+                assert_eq!(event.ev, LOCAL_BUY_TRADE_EVENT);
+                assert_eq!(event.exch_ts, test_ts_nano);
+                assert_eq!(event.px, 1260.01);
+                assert_eq!(event.qty, 0.3);
+            }
+            other => panic!("expect LiveEvent, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            PublishEvent::BatchEnd(dest) => assert_eq!(dest, TO_ALL),
+            other => panic!("expect BatchEnd, got {other:?}"),
+        }
+        assert_eq!(
+            Some(2),
+            stream.subscription_tracker.prev_seq,
+            "expect sequence number tracked"
+        )
     }
 
     #[tokio::test]

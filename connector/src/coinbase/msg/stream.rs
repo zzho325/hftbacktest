@@ -10,19 +10,21 @@ pub enum Stream {
     Subscriptions { events: Vec<SubscriptionEvent> },
     #[serde(rename = "l2_data")]
     Level2(ChannelMessage<Level2>),
+    #[serde(rename = "market_trades")]
+    Trade(ChannelMessage<Trade>),
     #[serde(rename = "heartbeats")]
     Heartbeat(ChannelMessage<Heartbeat>),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct SubscriptionEvent {
     pub subscriptions: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct ChannelMessage<T> {
-    pub client_id: String,
-    pub timestamp: DateTime<Utc>,
+    // pub client_id: String,
+    // pub timestamp: DateTime<Utc>,
     pub sequence_num: u64,
     pub events: Vec<T>,
 }
@@ -35,8 +37,8 @@ pub struct Level2 {
     pub updates: Vec<L2Update>,
 }
 
-#[derive(Debug, Deserialize)]
-pub enum Side {
+#[derive(Deserialize, Debug)]
+pub enum BookSide {
     #[serde(rename = "bid")]
     Bid,
     #[serde(rename = "offer")]
@@ -45,12 +47,39 @@ pub enum Side {
 
 #[derive(Deserialize, Debug)]
 pub struct L2Update {
-    pub side: Side,
+    pub side: BookSide,
     pub event_time: DateTime<Utc>,
     #[serde(deserialize_with = "from_str_to_f64")]
     pub price_level: f64,
     #[serde(deserialize_with = "from_str_to_f64")]
     pub new_quantity: f64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Trade {
+    // #[serde(rename = "type")]
+    // pub type_: String,
+    pub trades: Vec<TradeEvent>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct TradeEvent {
+    // pub trade_id: u64,
+    pub product_id: String,
+    #[serde(deserialize_with = "from_str_to_f64")]
+    pub price: f64,
+    #[serde(deserialize_with = "from_str_to_f64")]
+    pub size: f64,
+    pub side: Side,
+    pub time: DateTime<Utc>,
+}
+
+#[derive(Deserialize, Debug)]
+pub enum Side {
+    #[serde(rename = "SELL")]
+    Sell,
+    #[serde(rename = "BUY")]
+    Buy,
 }
 
 #[derive(Deserialize, Debug)]
