@@ -69,8 +69,7 @@ impl MarketDataStream {
 
     pub async fn connect(
         &mut self,
-        key_name: &str,
-        key_secret: &str,
+        jwt_signer: utils::JwtSigner,
         url: &str,
     ) -> Result<(), CoinbaseError> {
         let request = url.into_client_request().map_err(Box::new)?;
@@ -78,7 +77,7 @@ impl MarketDataStream {
         let (mut write, mut read) = ws_stream.split();
 
         // TODO: handle "authentication failure" caused by jwt expiration
-        let jwt = utils::sign_es256(&*self.utc_clock, key_name, key_secret);
+        let jwt = jwt_signer.sign();
         // Subscribe to heartbeat.
         utils::subscribe_ws(&mut write, "heartbeats", None, &jwt)
             .await

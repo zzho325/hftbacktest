@@ -70,6 +70,12 @@ pub mod testutils {
     }
 }
 
+pub struct JwtSigner {
+    utc_clock: Box<dyn Clock>,
+    key_name: String,
+    key_secret: String,
+}
+
 /// Defines the JWT claims
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -77,28 +83,39 @@ struct Claims {
     iss: String,
     nbf: usize,
     exp: usize,
+    uri: String,
 }
 
-pub fn sign_es256(clock: &dyn Clock, key_name: &str, key_secret: &str) -> String {
-    // Build JWT header with ES256, kid
-    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    header.kid = Some(key_name.to_string());
+impl JwtSigner {
+    pub fn new(api_key_name: impl Into<String>, api_key_secret: impl Into<String>) -> Self {
+        JwtSigner {
+            utc_clock: Box::new(SystemClock),
+            key_name: api_key_name.into(),
+            key_secret: api_key_secret.into(),
+        }
+    }
 
-    // Set issued-at and expiration (2 min) timestamps
-    let iat = clock.now().timestamp() as usize;
-    let exp = iat + 120;
+    pub fn sign(&self) -> String {
+        self.sign_with_uri("")
+    }
 
-    // Create the claims
-    let claims = Claims {
-        sub: key_name.to_string(),
-        iss: "cdp".to_string(),
-        nbf: iat,
-        exp,
-    };
+    pub fn sign_with_uri(&self, uri: impl Into<String>) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(self.key_name.clone());
 
-    // Encode the token
-    let encoding_key = jsonwebtoken::EncodingKey::from_ec_pem(key_secret.as_bytes()).unwrap();
+        let iat = self.utc_clock.now().timestamp() as usize;
+        let exp = iat + 120;
 
-    // Encode the token using ES256 and your EC key
-    jsonwebtoken::encode(&header, &claims, &encoding_key).unwrap()
+        let claims = Claims {
+            sub: self.key_name.clone(),
+            iss: "cdp".to_string(),
+            nbf: iat,
+            exp,
+            uri: uri.into(),
+        };
+
+        let encoding_key =
+            jsonwebtoken::EncodingKey::from_ec_pem(self.key_secret.as_bytes()).unwrap();
+        jsonwebtoken::encode(&header, &claims, &encoding_key).unwrap()
+    }
 }

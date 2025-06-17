@@ -46,11 +46,13 @@ impl From<CoinbaseError> for Value {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub struct Config {
-    public_url: String,
-    private_url: String,
-    key_name: String,
-    key_secret: String,
+    public_ws_url: String,
+    private_ws_url: String,
+    rest_api_url: String,
+    api_key_name: String,
+    api_key_secret: String,
     #[serde(default)]
     order_prefix: String,
 }
@@ -84,9 +86,9 @@ impl ConnectorBuilder for Coinbase {
 
 impl Coinbase {
     pub fn connect_market_data_stream(&mut self, ev_tx: UnboundedSender<PublishEvent>) {
-        let public_url = self.config.public_url.clone();
-        let key_name = self.config.key_name.clone();
-        let key_secret = self.config.key_secret.clone();
+        let public_ws_url = self.config.public_ws_url.clone();
+        let api_key_name = self.config.api_key_name.clone();
+        let api_key_secret = self.config.api_key_secret.clone();
         let symbol_tx = self.symbol_tx.clone();
 
         tokio::spawn(async move {
@@ -106,11 +108,15 @@ impl Coinbase {
                 })
                 .retry(|| async {
                     let mut stream = market_data_stream::MarketDataStream::new(
-                        // client.clone(),
                         ev_tx.clone(),
                         symbol_tx.subscribe(),
                     );
-                    stream.connect(&key_name, &key_secret, &public_url).await?;
+                    stream
+                        .connect(
+                            utils::JwtSigner::new(&api_key_name, &api_key_secret),
+                            &public_ws_url,
+                        )
+                        .await?;
                     Ok(())
                 })
                 .await;
