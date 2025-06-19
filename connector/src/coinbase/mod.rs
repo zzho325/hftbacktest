@@ -1,6 +1,9 @@
 mod market_data_stream;
 mod msg;
 mod ordermanager;
+mod rest;
+#[cfg(test)]
+mod rest_test;
 mod utils;
 
 use std::{
@@ -25,18 +28,56 @@ use crate::{
     utils::{ExponentialBackoff, Retry},
 };
 
+/// Top-level error aggregating all sub-systems
 #[derive(Error, Debug)]
 pub enum CoinbaseError {
+    #[error("REST client: {0}")]
+    Rest(#[from] RestClientError),
+
+    #[error("Market data stream: {0}")]
+    MarketStream(#[from] MarketStreamError),
+}
+
+#[derive(Error, Debug)]
+pub enum RestClientError {
+    /// Network-level failures (HTTP send, connection issues)
+    #[error("NetworkError: {0}")]
+    NetworkError(#[from] reqwest::Error),
+
+    /// Http non-200 reponse or failure parseing response
+    #[error("ServiceError: status = {status}, body = {body}")]
+    ServiceError {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+
+    /// Internal errors (header construction)
+    #[error("InternalError: {0}")]
+    InternalError(String),
+}
+
+#[derive(Error, Debug)]
+pub enum MarketStreamError {
     #[error("SubscriptionRequestMissed: {0}")]
     SubscriptionRequestMissed(String),
-    #[error("WebSocketStreamError: {0}")]
-    WebSocketStreamError(String),
-    #[error("ConnectionAbort: {0}")]
-    ConnectionAbort(String),
-    #[error("WebSocketTransportError: {0:?}")]
-    WebSocketTransportError(#[from] Box<tungstenite::Error>),
-    #[error("ConnectionInterrupted: {0}")]
-    ConnectionInterrupted(String),
+
+    /// Stream violated the expected streaming protocol
+    #[error("ProtocolViolation: {0}")]
+    ProtocolViolation(String),
+
+    /// Server-sent error message or failure parsing message
+    #[error("ServiceError: {0}")]
+    ServiceError(String),
+
+    /// Connection-level failures such as transport errors or interruptions
+    #[error("WebSocketConnectionError: {0}")]
+    WebSocketConnectionError(String),
+}
+
+impl From<Box<tungstenite::Error>> for MarketStreamError {
+    fn from(err: Box<tungstenite::Error>) -> Self {
+        MarketStreamError::WebSocketConnectionError(format!("WebSocket transport error: {}", err))
+    }
 }
 
 impl From<CoinbaseError> for Value {

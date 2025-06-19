@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer};
 
-use crate::utils::from_str_to_f64;
+use crate::{coinbase::msg::Side, utils::from_str_to_f64};
 
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
@@ -79,14 +79,6 @@ pub struct TradeEvent {
     pub size: f64,
     pub side: Side,
     pub time: DateTime<Utc>,
-}
-
-#[derive(Deserialize, Debug)]
-pub enum Side {
-    #[serde(rename = "SELL")]
-    Sell,
-    #[serde(rename = "BUY")]
-    Buy,
 }
 
 #[derive(Deserialize, Debug)]

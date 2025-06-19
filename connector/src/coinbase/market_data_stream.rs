@@ -31,8 +31,11 @@ use tracing::{debug, error};
 
 use crate::{
     coinbase::{
-        CoinbaseError,
-        msg::stream::{BookSide, Channel, ChannelMessage, Error, Level2, Side, Stream, Trade},
+        MarketStreamError,
+        msg::{
+            Side,
+            stream::{BookSide, Channel, ChannelMessage, Error, Level2, Stream, Trade},
+        },
         utils::{self, Clock},
     },
     connector::PublishEvent,
@@ -46,6 +49,8 @@ pub struct MarketDataStream {
     /// Tracks if snapshot has been received for a symbol from level2 channel.
     level2_symbol_status: HashMap<String, bool>,
 }
+
+type Result<T> = std::result::Result<T, MarketStreamError>;
 
 impl MarketDataStream {
     // Coinbase sends heartbeats per second, errors out when no heartbeat is received for 2 sec.
@@ -67,11 +72,7 @@ impl MarketDataStream {
         self
     }
 
-    pub async fn connect(
-        &mut self,
-        jwt_signer: utils::JwtSigner,
-        url: &str,
-    ) -> Result<(), CoinbaseError> {
+    pub async fn connect(&mut self, jwt_signer: utils::JwtSigner, url: &str) -> Result<()> {
         let request = url.into_client_request().map_err(Box::new)?;
         let (ws_stream, _) = connect_async(request).await.map_err(Box::new)?;
         let (mut write, mut read) = ws_stream.split();
@@ -93,8 +94,8 @@ impl MarketDataStream {
                     if last_heartbeat
                         .map(|t| t.elapsed() > Self::HEARTBEAT_INTERVAL)
                         .unwrap_or(true) {
-                            return Err(CoinbaseError::ConnectionInterrupted(
-                                "missing heartbeats".to_string()
+                            return Err(MarketStreamError::WebSocketConnectionError(
+                                "Missing heartbeats".to_string()
                             ));
                     }
                 },
@@ -112,8 +113,8 @@ impl MarketDataStream {
                             return Ok(());
                         },
                         Err(RecvError::Lagged(num)) => {
-                            return Err(CoinbaseError::SubscriptionRequestMissed(
-                                format!("{num} Subscription requests were missed.")
+                            return Err(MarketStreamError::SubscriptionRequestMissed(
+                                format!("{num} subscription requests were missed.")
                             ));
                         },
                     }
@@ -127,19 +128,19 @@ impl MarketDataStream {
                             write.send(Message::Pong(data)).await.map_err(Box::new)?;
                         },
                         Some(Ok(Message::Close(close_frame))) => {
-                            return Err(CoinbaseError::ConnectionAbort(
-                                format!("Websocket closed: {close_frame:?}")
+                            return Err(MarketStreamError::WebSocketConnectionError(
+                                format!("WebSocket closed: {close_frame:?}")
                            ));
                         },
                         Some(Ok(Message::Binary(_)))
                         | Some(Ok(Message::Frame(_)))
                         | Some(Ok(Message::Pong(_))) => {},
                         Some(Err(error)) => {
-                            return Err(CoinbaseError::from(Box::new(error)));
+                            return Err(MarketStreamError::from(Box::new(error)));
                         },
                         None => {
-                            return Err(CoinbaseError::ConnectionInterrupted(
-                                "No websocket message".to_string()
+                            return Err(MarketStreamError::WebSocketConnectionError(
+                                "No WebSocket message".to_string()
                             ));
                         },
                     }
@@ -152,7 +153,7 @@ impl MarketDataStream {
         &mut self,
         steam_msg: String,
         last_heartbeat: &mut Option<Instant>,
-    ) -> Result<(), CoinbaseError> {
+    ) -> Result<()> {
         match serde_json::from_str::<Stream>(&steam_msg) {
             Ok(Stream::Channel(Channel::Subscriptions { events })) => {
                 for event in events {
@@ -170,7 +171,7 @@ impl MarketDataStream {
                 self.subscription_tracker
                     .track_seq("heartbeat", heartbeat.sequence_num);
                 if heartbeat.events.len() != 1 {
-                    return Err(CoinbaseError::WebSocketStreamError(format!(
+                    return Err(MarketStreamError::ProtocolViolation(format!(
                         "Invalid heartbeat {heartbeat:?}"
                     )));
                 }
@@ -182,7 +183,7 @@ impl MarketDataStream {
                 let now_utc = self.utc_clock.now();
                 let age = now_utc.signed_duration_since(event.current_time);
                 if age > chrono::TimeDelta::from_std(Self::HEARTBEAT_INTERVAL).unwrap() {
-                    return Err(CoinbaseError::WebSocketStreamError(format!(
+                    return Err(MarketStreamError::ProtocolViolation(format!(
                         "Heartbeat is {} seconds old!",
                         age.num_seconds()
                     )));
@@ -192,18 +193,15 @@ impl MarketDataStream {
             Ok(Stream::Channel(Channel::Level2(level2))) => self.process_level2_channel(level2),
             Ok(Stream::Channel(Channel::Trade(trade))) => self.process_trade_channel(trade),
             Ok(Stream::Error(Error::ErrorMessage { message })) => {
-                Err(CoinbaseError::WebSocketStreamError(message))
+                Err(MarketStreamError::ServiceError(message))
             }
-            Err(err) => Err(CoinbaseError::WebSocketStreamError(format!(
+            Err(err) => Err(MarketStreamError::ServiceError(format!(
                 "Couldn't parse message {steam_msg}: {err}"
             ))),
         }
     }
 
-    fn process_level2_channel(
-        &mut self,
-        data: ChannelMessage<Level2>,
-    ) -> Result<(), CoinbaseError> {
+    fn process_level2_channel(&mut self, data: ChannelMessage<Level2>) -> Result<()> {
         self.subscription_tracker
             .track_seq("level2", data.sequence_num);
 
@@ -252,7 +250,7 @@ impl MarketDataStream {
         Ok(())
     }
 
-    fn process_trade_channel(&mut self, data: ChannelMessage<Trade>) -> Result<(), CoinbaseError> {
+    fn process_trade_channel(&mut self, data: ChannelMessage<Trade>) -> Result<()> {
         self.subscription_tracker
             .track_seq("trade", data.sequence_num);
         for event in data.events {
@@ -284,7 +282,7 @@ impl MarketDataStream {
     }
 }
 
-/// Tracks missing messages for a websocket subscription with sequence numbers and heartbeat
+/// Tracks missing messages for a WebSocket subscription with sequence numbers and heartbeat
 /// counter, logging any out-of-order or missing (dropped) messages.
 struct SubscriptionTracker {
     prev_seq: Option<u64>,
@@ -356,7 +354,7 @@ mod tests {
 
     use crate::{
         coinbase::{
-            CoinbaseError,
+            MarketStreamError,
             market_data_stream::MarketDataStream,
             utils::testutils::MockClock,
         },
@@ -628,7 +626,7 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(CoinbaseError::WebSocketStreamError(ref msg))
+                Err(MarketStreamError::ServiceError(ref msg))
                     if msg == "authentication failure",
             ),
             "expect Err(WebSocketStreamError(\"authentication failure\")), got {res:?}"
