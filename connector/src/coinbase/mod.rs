@@ -22,7 +22,10 @@ use tokio_tungstenite::tungstenite;
 use tracing::error;
 
 use crate::{
-    coinbase::ordermanager::{OrderManager, SharedOrderManager},
+    coinbase::{
+        ordermanager::{OrderManager, SharedOrderManager},
+        utils::SystemClock,
+    },
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
     utils::{ExponentialBackoff, Retry},
 };
@@ -164,6 +167,7 @@ impl Coinbase {
                     let mut stream = market_data_stream::MarketDataStream::new(
                         ev_tx.clone(),
                         symbol_tx.subscribe(),
+                        SystemClock,
                     );
                     stream
                         .connect(

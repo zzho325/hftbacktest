@@ -71,7 +71,6 @@ pub mod testutils {
 }
 
 pub struct JwtSigner {
-    utc_clock: Box<dyn Clock>,
     key_name: String,
     key_secret: String,
 }
@@ -89,7 +88,6 @@ struct Claims {
 impl JwtSigner {
     pub fn new(api_key_name: impl Into<String>, api_key_secret: impl Into<String>) -> Self {
         JwtSigner {
-            utc_clock: Box::new(SystemClock),
             key_name: api_key_name.into(),
             key_secret: api_key_secret.into(),
         }
@@ -103,7 +101,7 @@ impl JwtSigner {
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some(self.key_name.clone());
 
-        let iat = self.utc_clock.now().timestamp() as usize;
+        let iat = Utc::now().timestamp() as usize;
         let exp = iat + 120;
 
         let claims = Claims {
