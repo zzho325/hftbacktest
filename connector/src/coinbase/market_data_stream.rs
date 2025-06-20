@@ -182,7 +182,10 @@ impl MarketDataStream {
                 // Error out if heartbeat timestamp > 2 seconds behind.
                 let now_utc = self.utc_clock.now();
                 let age = now_utc.signed_duration_since(event.current_time);
-                if age > chrono::TimeDelta::from_std(Self::HEARTBEAT_INTERVAL).unwrap() {
+                let delta = chrono::TimeDelta::from_std(Self::HEARTBEAT_INTERVAL).map_err(|e| {
+                    MarketStreamError::InternalError(format!("invalid heartbeat interval: {}", e))
+                })?;
+                if age > delta {
                     return Err(MarketStreamError::ProtocolViolation(format!(
                         "Heartbeat is {} seconds old!",
                         age.num_seconds()
@@ -222,30 +225,34 @@ impl MarketDataStream {
 
             // TODO: when connector is killed sending messages here would panic because receivers
             // has been dropped, should refactor connector exit order
-            self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
+            self.ev_tx.send(PublishEvent::BatchStart(TO_ALL))?;
             for update in event.updates {
                 let depth_ev = match update.side {
                     BookSide::Bid => LOCAL_BID_DEPTH_EVENT,
                     BookSide::Ask => LOCAL_ASK_DEPTH_EVENT,
                 };
 
-                self.ev_tx
-                    .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                        symbol: event.product_id.clone(),
-                        event: Event {
-                            ev: depth_ev,
-                            exch_ts: update.event_time.timestamp_nanos_opt().unwrap(),
-                            local_ts: self.utc_clock.now().timestamp_nanos_opt().unwrap(),
-                            order_id: 0,
-                            px: update.price_level,
-                            qty: update.new_quantity,
-                            ival: 0,
-                            fval: 0.0,
-                        },
-                    }))
-                    .unwrap();
+                self.ev_tx.send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                    symbol: event.product_id.clone(),
+                    event: Event {
+                        ev: depth_ev,
+                        exch_ts: update.event_time.timestamp_nanos_opt().ok_or_else(|| {
+                            MarketStreamError::ServiceError(
+                                "exchange timestamp out-of-range".into(),
+                            )
+                        })?,
+                        local_ts: self.utc_clock.now().timestamp_nanos_opt().ok_or_else(|| {
+                            MarketStreamError::InternalError("local timestamp out-of-range".into())
+                        })?,
+                        order_id: 0,
+                        px: update.price_level,
+                        qty: update.new_quantity,
+                        ival: 0,
+                        fval: 0.0,
+                    },
+                }))?;
             }
-            self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
+            self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL))?;
         }
         Ok(())
     }
@@ -254,29 +261,34 @@ impl MarketDataStream {
         self.subscription_tracker
             .track_seq("trade", data.sequence_num);
         for event in data.events {
-            self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
+            self.ev_tx.send(PublishEvent::BatchStart(TO_ALL))?;
             for trade in event.trades {
                 let trade_ev = match trade.side {
                     Side::Sell => LOCAL_SELL_TRADE_EVENT,
                     Side::Buy => LOCAL_BUY_TRADE_EVENT,
                 };
-                self.ev_tx
-                    .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                        symbol: trade.product_id.clone(),
-                        event: Event {
-                            ev: trade_ev,
-                            exch_ts: trade.time.timestamp_nanos_opt().unwrap(),
-                            local_ts: self.utc_clock.now().timestamp_nanos_opt().unwrap(),
-                            order_id: 0,
-                            px: trade.price,
-                            qty: trade.size,
-                            ival: 0,
-                            fval: 0.0,
-                        },
-                    }))
-                    .unwrap();
+                self.ev_tx.send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                    symbol: trade.product_id.clone(),
+                    event: Event {
+                        ev: trade_ev,
+                        exch_ts: trade.time.timestamp_nanos_opt().ok_or_else(|| {
+                            MarketStreamError::ServiceError(
+                                "exchange timestamp out-of-range".into(),
+                            )
+                        })?,
+                        local_ts: self.utc_clock.now().timestamp_nanos_opt().ok_or_else(|| {
+                            MarketStreamError::InternalError("local timestamp out-of-range".into())
+                        })?,
+
+                        order_id: 0,
+                        px: trade.price,
+                        qty: trade.size,
+                        ival: 0,
+                        fval: 0.0,
+                    },
+                }))?;
             }
-            self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
+            self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL))?;
         }
         Ok(())
     }

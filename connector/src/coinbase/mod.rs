@@ -11,7 +11,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::Error;
 use hftbacktest::types::{ErrorKind, LiveError, LiveEvent, Order, Value};
 use serde::Deserialize;
 use thiserror::Error;
@@ -31,6 +30,9 @@ use crate::{
 /// Top-level error aggregating all sub-systems
 #[derive(Error, Debug)]
 pub enum CoinbaseError {
+    #[error("Invalid config: {0}")]
+    ConfigError(#[from] toml::de::Error),
+
     #[error("REST client: {0}")]
     Rest(#[from] RestClientError),
 
@@ -51,7 +53,7 @@ pub enum RestClientError {
         body: String,
     },
 
-    /// Internal errors (header construction)
+    /// Internal errors (url parsing, header construction)
     #[error("InternalError: {0}")]
     InternalError(String),
 }
@@ -72,11 +74,21 @@ pub enum MarketStreamError {
     /// Connection-level failures such as transport errors or interruptions
     #[error("WebSocketConnectionError: {0}")]
     WebSocketConnectionError(String),
+
+    /// Internal errors
+    #[error("InternalError: {0}")]
+    InternalError(String),
 }
 
 impl From<Box<tungstenite::Error>> for MarketStreamError {
     fn from(err: Box<tungstenite::Error>) -> Self {
-        MarketStreamError::WebSocketConnectionError(format!("WebSocket transport error: {}", err))
+        MarketStreamError::WebSocketConnectionError(format!("WebSocket transport error: {err}"))
+    }
+}
+
+impl From<tokio::sync::mpsc::error::SendError<PublishEvent>> for MarketStreamError {
+    fn from(err: tokio::sync::mpsc::error::SendError<PublishEvent>) -> Self {
+        MarketStreamError::InternalError(format!("Tokio send error: {err}"))
     }
 }
 
@@ -109,9 +121,9 @@ pub struct Coinbase {
 }
 
 impl ConnectorBuilder for Coinbase {
-    type Error = Error;
+    type Error = CoinbaseError;
 
-    fn build_from(config: &str) -> Result<Self, Error> {
+    fn build_from(config: &str) -> Result<Self, Self::Error> {
         let config: Config = toml::from_str(config)?;
         let order_manager = Arc::new(Mutex::new(OrderManager::new(&config.order_prefix)));
         let (symbol_tx, _) = broadcast::channel(500);
@@ -134,15 +146,16 @@ impl Coinbase {
 
         tokio::spawn(async move {
             let _ = Retry::new(ExponentialBackoff::default())
-                .error_handler(|error: CoinbaseError| {
-                    error!(
-                        ?error,
-                        "An error occurred in the market data stream connection."
-                    );
+                .error_handler(|e: CoinbaseError| {
+                    // TODO: instead of panic, handle error gracefully
+                    if let CoinbaseError::MarketStream(MarketStreamError::InternalError(msg)) = &e {
+                        panic!("MarketStream internal error: {}", msg);
+                    }
+                    error!("An error occurred in the market data stream connection: {e}");
                     ev_tx
                         .send(PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
                             ErrorKind::ConnectionInterrupted,
-                            error.into(),
+                            e.into(),
                         ))))
                         .unwrap();
                     Ok(())

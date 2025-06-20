@@ -28,8 +28,12 @@ impl CoinbaseClient {
     }
 
     async fn get<T: DeserializeOwned>(&self, resource: &str) -> Result<T> {
-        let parsed = Url::parse(&self.rest_api_url).unwrap();
-        let request_host = parsed.host_str().unwrap();
+        let parsed = Url::parse(&self.rest_api_url).map_err(|e| {
+            RestClientError::InternalError(format!("error parsing REST API url {e}"))
+        })?;
+        let request_host = parsed.host_str().ok_or_else(|| {
+            RestClientError::InternalError(format!("REST URL has no host: {}", self.rest_api_url))
+        })?;
         let base_path = parsed.path();
         let uri = format!("GET {request_host}{base_path}/{resource}");
         let jwt = self.jwt_signer.sign_with_uri(uri);
@@ -55,8 +59,12 @@ impl CoinbaseClient {
         resource: &str,
         payload: &U,
     ) -> Result<T> {
-        let parsed = Url::parse(&self.rest_api_url).unwrap();
-        let request_host = parsed.host_str().unwrap();
+        let parsed = Url::parse(&self.rest_api_url).map_err(|e| {
+            RestClientError::InternalError(format!("error parsing REST API url {e}"))
+        })?;
+        let request_host = parsed.host_str().ok_or_else(|| {
+            RestClientError::InternalError(format!("REST URL has no host: {}", self.rest_api_url))
+        })?;
         let base_path = parsed.path();
 
         let uri = format!("POST {request_host}{base_path}/{resource}");
