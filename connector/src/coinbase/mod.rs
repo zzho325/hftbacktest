@@ -25,6 +25,7 @@ use crate::{
     coinbase::{
         ordermanager::{OrderManager, SharedOrderManager},
         rest::CoinbaseClient,
+        utils::SystemClock,
     },
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
     utils::{ExponentialBackoff, Retry},
@@ -177,6 +178,7 @@ impl Coinbase {
                     let mut stream = market_data_stream::MarketDataStream::new(
                         ev_tx.clone(),
                         symbol_tx.subscribe(),
+                        SystemClock,
                     );
                     stream
                         .connect(

@@ -41,8 +41,8 @@ use crate::{
     connector::PublishEvent,
 };
 
-pub struct MarketDataStream {
-    utc_clock: Box<dyn Clock>,
+pub struct MarketDataStream<C: Clock> {
+    utc_clock: C,
     ev_tx: UnboundedSender<PublishEvent>,
     symbol_rx: Receiver<String>,
     subscription_tracker: SubscriptionTracker,
@@ -52,24 +52,22 @@ pub struct MarketDataStream {
 
 type Result<T> = std::result::Result<T, MarketStreamError>;
 
-impl MarketDataStream {
+impl<C: Clock> MarketDataStream<C> {
     // Coinbase sends heartbeats per second, errors out when no heartbeat is received for 2 sec.
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
-    pub fn new(ev_tx: UnboundedSender<PublishEvent>, symbol_rx: Receiver<String>) -> Self {
+    pub fn new(
+        ev_tx: UnboundedSender<PublishEvent>,
+        symbol_rx: Receiver<String>,
+        clock: C,
+    ) -> Self {
         Self {
-            utc_clock: Box::new(utils::SystemClock),
+            utc_clock: clock,
             ev_tx,
             symbol_rx,
             subscription_tracker: SubscriptionTracker::new(),
             level2_symbol_status: Default::default(),
         }
-    }
-
-    #[cfg(test)]
-    pub fn with_clock(mut self, clock: Box<dyn Clock>) -> Self {
-        self.utc_clock = clock;
-        self
     }
 
     pub async fn connect(&mut self, jwt_signer: utils::JwtSigner, url: &str) -> Result<()> {
@@ -368,7 +366,7 @@ mod tests {
         coinbase::{
             MarketStreamError,
             market_data_stream::MarketDataStream,
-            utils::testutils::MockClock,
+            utils::{SystemClock, testutils::MockClock},
         },
         connector::PublishEvent,
     };
@@ -377,7 +375,7 @@ mod tests {
     async fn process_level2_messages() {
         let (tx, mut rx) = mpsc::unbounded_channel::<PublishEvent>();
         let (_sym_tx, sym_rx) = broadcast::channel(1);
-        let mut stream = MarketDataStream::new(tx, sym_rx);
+        let mut stream = MarketDataStream::new(tx, sym_rx, SystemClock);
         let mut last_heartbeat: Option<Instant> = None;
 
         let test_ts = "2025-06-01T20:32:50Z";
@@ -499,7 +497,7 @@ mod tests {
     async fn process_trade_messages() {
         let (tx, mut rx) = mpsc::unbounded_channel::<PublishEvent>();
         let (_sym_tx, sym_rx) = broadcast::channel(1);
-        let mut stream = MarketDataStream::new(tx, sym_rx);
+        let mut stream = MarketDataStream::new(tx, sym_rx, SystemClock);
         let mut last_heartbeat: Option<Instant> = None;
 
         let test_ts = "2025-06-01T20:32:50Z";
@@ -569,7 +567,7 @@ mod tests {
 
         let mock_clock = MockClock::new(heartbeat_dt);
         let clock_clone = mock_clock.clone();
-        let mut stream = MarketDataStream::new(tx, sym_rx).with_clock(Box::new(clock_clone));
+        let mut stream = MarketDataStream::new(tx, sym_rx, clock_clone);
         let mut last_heartbeat: Option<Instant> = None;
 
         let heartbeat = json!({
@@ -631,7 +629,7 @@ mod tests {
     async fn process_authentication_failure() {
         let (tx, _) = mpsc::unbounded_channel::<PublishEvent>();
         let (_sym_tx, sym_rx) = broadcast::channel(1);
-        let mut stream = MarketDataStream::new(tx, sym_rx);
+        let mut stream = MarketDataStream::new(tx, sym_rx, SystemClock);
         let mut last_heartbeat: Option<Instant> = None;
         let error_msg = json!({"type":"error","message":"authentication failure"}).to_string();
         let res = stream.process_ws_stream(error_msg, &mut last_heartbeat);
