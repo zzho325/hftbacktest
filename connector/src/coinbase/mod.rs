@@ -22,7 +22,10 @@ use tokio_tungstenite::tungstenite;
 use tracing::error;
 
 use crate::{
-    coinbase::ordermanager::{OrderManager, SharedOrderManager},
+    coinbase::{
+        ordermanager::{OrderManager, SharedOrderManager},
+        rest::CoinbaseClient,
+    },
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
     utils::{ExponentialBackoff, Retry},
 };
@@ -38,6 +41,9 @@ pub enum CoinbaseError {
 
     #[error("Market data stream: {0}")]
     MarketStream(#[from] MarketStreamError),
+
+    #[error("Order: {0}")]
+    Order(#[from] OrderError),
 }
 
 #[derive(Error, Debug)]
@@ -80,6 +86,9 @@ pub enum MarketStreamError {
     InternalError(String),
 }
 
+#[derive(Error, Debug)]
+pub enum OrderError {}
+
 impl From<Box<tungstenite::Error>> for MarketStreamError {
     fn from(err: Box<tungstenite::Error>) -> Self {
         MarketStreamError::WebSocketConnectionError(format!("WebSocket transport error: {err}"))
@@ -117,7 +126,7 @@ pub struct Coinbase {
     config: Config,
     symbols: SharedSymbolSet,
     symbol_tx: Sender<String>, // Channel to subscribe to symbol.
-    order_manager: SharedOrderManager,
+    order_manager: SharedOrderManager<CoinbaseClient>,
 }
 
 impl ConnectorBuilder for Coinbase {
@@ -125,7 +134,11 @@ impl ConnectorBuilder for Coinbase {
 
     fn build_from(config: &str) -> Result<Self, Self::Error> {
         let config: Config = toml::from_str(config)?;
-        let order_manager = Arc::new(Mutex::new(OrderManager::new(&config.order_prefix)));
+        let client = CoinbaseClient::new(
+            utils::JwtSigner::new(&config.api_key_name, &config.api_key_secret),
+            &config.rest_api_url,
+        );
+        let order_manager = Arc::new(Mutex::new(OrderManager::new(client, &config.order_prefix)));
         let (symbol_tx, _) = broadcast::channel(500);
 
         Ok(Coinbase {
@@ -195,7 +208,19 @@ impl Connector for Coinbase {
         self.connect_market_data_stream(ev_tx.clone());
     }
 
-    fn submit(&self, symbol: String, order: Order, tx: UnboundedSender<PublishEvent>) {}
+    fn submit(&self, symbol: String, order: Order, tx: UnboundedSender<PublishEvent>) {
+        let result = self
+            .order_manager
+            .lock()
+            .unwrap()
+            .create_order(&symbol, order);
+        match result {
+            Ok(order) => {
+                tx.send(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order }))
+                    .unwrap();
+            }
+        }
+    }
 
     fn cancel(&self, symbol: String, order: Order, tx: UnboundedSender<PublishEvent>) {}
 }

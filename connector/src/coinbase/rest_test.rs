@@ -7,7 +7,12 @@ use std::fs::read_to_string;
 
 use serde_json::json;
 
-use crate::coinbase::{Config, msg::Side, rest::CoinbaseClient, utils::JwtSigner};
+use crate::coinbase::{
+    Config,
+    msg::Side,
+    rest::{CoinbaseClient, RestClient as _},
+    utils::JwtSigner,
+};
 
 const SANDBOX_URL: &str = "https://api-sandbox.coinbase.com/api/v3/brokerage";
 
