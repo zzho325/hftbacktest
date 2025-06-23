@@ -70,6 +70,7 @@ pub mod testutils {
     }
 }
 
+#[derive(Clone)]
 pub struct JwtSigner {
     key_name: String,
     key_secret: String,

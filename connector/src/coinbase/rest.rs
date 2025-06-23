@@ -1,27 +1,39 @@
+use async_trait::async_trait;
 use reqwest::Url;
 use serde::{Serialize, de::DeserializeOwned};
-use serde_json::json;
 
 use crate::coinbase::{
     RestClientError,
-    msg::{Side, rest::OrderResponse},
-    utils::{self, Clock, SystemClock},
+    msg::rest::{OrderRequest, OrderResponse},
+    utils::{self},
 };
 
-pub struct CoinbaseClient {
+type Result<T> = std::result::Result<T, RestClientError>;
+
+#[async_trait]
+pub trait CoinbaseClient: Clone + Send + Sync + 'static {
+    async fn submit_order(&self, order_req: OrderRequest) -> Result<OrderResponse>;
+}
+
+#[derive(Clone)]
+pub struct CoinbaseClientImpl {
     jwt_signer: utils::JwtSigner,
-    utc_clock: Box<dyn Clock>,
     rest_api_url: String,
     client: reqwest::Client,
 }
 
-type Result<T> = std::result::Result<T, RestClientError>;
+#[async_trait]
+impl CoinbaseClient for CoinbaseClientImpl {
+    async fn submit_order(&self, order_req: OrderRequest) -> Result<OrderResponse> {
+        self.post::<OrderRequest, OrderResponse>("orders", &order_req)
+            .await
+    }
+}
 
-impl CoinbaseClient {
+impl CoinbaseClientImpl {
     pub fn new(jwt_signer: utils::JwtSigner, host: impl Into<String>) -> Self {
         Self {
             jwt_signer,
-            utc_clock: Box::new(SystemClock),
             rest_api_url: host.into(),
             client: reqwest::Client::new(),
         }
@@ -54,7 +66,7 @@ impl CoinbaseClient {
         Self::handle_resp(resp).await
     }
 
-    async fn post<T: DeserializeOwned, U: Serialize>(
+    async fn post<U: Serialize, T: DeserializeOwned>(
         &self,
         resource: &str,
         payload: &U,
@@ -109,26 +121,5 @@ impl CoinbaseClient {
         })?;
 
         Ok(result)
-    }
-
-    // TODO: using json value for order_configuration for now, should switch to typed struct.
-    pub async fn submit_order(
-        &self,
-        client_order_id: &str,
-        symbol: &str,
-        side: Side,
-        order_configuration: serde_json::Value,
-    ) -> Result<OrderResponse> {
-        let payload = json!({
-            "client_order_id": client_order_id,
-            "product_id": symbol,
-            "side": side,
-            "order_configuration": order_configuration
-        });
-
-        let resp = self
-            .post::<OrderResponse, serde_json::Value>("orders", &payload)
-            .await?;
-        Ok(resp)
     }
 }

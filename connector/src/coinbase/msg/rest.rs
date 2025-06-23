@@ -1,7 +1,38 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::coinbase::msg::Side;
+
+#[derive(Serialize, Debug)]
+pub struct OrderRequest {
+    pub client_order_id: String,
+    pub product_id: String,
+    pub side: Side,
+    #[serde(rename = "order_configuration")]
+    pub order_config: OrderConfiguration,
+}
+
+#[derive(Serialize, Debug)]
+pub enum OrderConfiguration {
+    #[serde(rename = "market_market_ioc")]
+    MarketIOC { quote_size: String },
+    #[serde(rename = "sor_limit_ioc")]
+    LimitIOC {
+        quote_size: String,
+        limit_price: String,
+    },
+    #[serde(rename = "limit_limit_gtc")]
+    LimitGTC {
+        quote_size: String,
+        limit_price: String,
+        post_only: bool,
+    },
+    #[serde(rename = "limit_limit_fok")]
+    LimitFOK {
+        quote_size: String,
+        limit_price: String,
+    },
+}
 
 #[derive(Deserialize, Debug)]
 pub struct OrderResponse {
